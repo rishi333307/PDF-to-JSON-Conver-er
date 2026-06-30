@@ -93,23 +93,7 @@ The saved output now includes TWO JSON files per upload:
   same headers are automatically reused for every later page that
   continues the same table.
 
-Example `<name>.records.json`:
-```json
-[
-  {
-    "id": "92335",
-    "date": "06.08.2026",
-    "company": "Transocean",
-    "whatWasSeen": "..."
-  },
-  {
-    "id": "92336",
-    "date": "06.08.2026",
-    "company": "Scantech",
-    "whatWasSeen": "...",
-    "commentsAddedByRigLeadership": "..."
-  }
-]
+
 ```
 
 The full `<name>.json` always includes a `pages` array reporting the
