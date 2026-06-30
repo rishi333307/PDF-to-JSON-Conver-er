@@ -1,0 +1,22 @@
+# Local-dev convenience: `docker compose up --build` builds the image
+# and starts the service at http://localhost:5000, with uploads/outputs
+# persisted to your local filesystem (so generated JSON survives a
+# container restart and is easy to inspect).
+#
+# This file is NOT used by Railway (Railway builds the Dockerfile
+# directly and ignores docker-compose.yml). It's purely for testing the
+# container on your own machine before deploying it.
+services:
+  pdf-to-json:
+    build: .
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./uploads:/app/uploads
+      - ./outputs:/app/outputs
+    environment:
+      - PORT=5000
+      - WEB_CONCURRENCY=1
+      - MAX_PDF_BYTES=52428800
+      - URL_FETCH_TIMEOUT_SECONDS=30
+    restart: unless-stopped

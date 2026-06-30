@@ -1,0 +1,25 @@
+flask
+flask-cors
+requests
+camelot-py[cv]
+pdfplumber
+pandas
+
+# --- Parallel PDF processing (multi-file upload / concurrency sizing) ---
+# psutil is used to read REAL available RAM and to correctly respect
+# Docker/cgroup CPU+memory limits when deciding how many PDFs can
+# safely be processed at the same time. See concurrency_limit.py and
+# cpu_detect.py for the full reasoning.
+psutil
+
+# --- Per-page text/image classification engine (REQUIRED for accuracy) ---
+# PyMuPDF is what lets the app tell, for every single page, whether it
+# has real text, a raster image (scanned look), both, or neither.
+PyMuPDF
+
+# --- OCR support (used automatically for "image"-only pages) ---
+# Needed so pages with no real text layer (scans/photos) can still be
+# read. Also requires the Tesseract OCR engine + poppler installed on
+# your system (see README.md "Optional: Enabling OCR fallback").
+pytesseract
+pdf2image

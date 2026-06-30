@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PDF to JSON Converter</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <div class="container">
+    <h1>📄 PDF → JSON Converter</h1>
+    <p class="subtitle">Upload a PDF. Each page is checked for real text, embedded images, or both — then converted to a downloadable JSON file.</p>
+
+    <!-- Upload form -->
+    <div class="upload-box">
+      <input type="file" id="pdfInput" accept="application/pdf" multiple />
+      <button id="uploadBtn">Upload &amp; Convert</button>
+      <p class="batch-hint">Select one file, or several at once — multiple PDFs are processed together (in parallel where the server has the capacity to do so).</p>
+    </div>
+
+    <p class="or-divider">— or —</p>
+
+    <!-- URL form -->
+    <div class="upload-box">
+      <input type="url" id="pdfUrlInput" placeholder="https://example.com/file.pdf" />
+      <button id="urlBtn">Fetch &amp; Convert</button>
+    </div>
+
+    <!-- Loading indicator (hidden by default) -->
+    <p id="loadingText" class="loading hidden">⏳ Processing... please wait</p>
+
+    <!-- Status / error messages -->
+    <p id="statusText" class="status"></p>
+
+    <!-- Per-file batch progress / results (shown only for multi-file uploads) -->
+    <div id="batchResultsWrap" class="batch-results-wrap hidden">
+      <h2>Files in this batch</h2>
+      <ul id="batchResultsList" class="batch-results-list"></ul>
+    </div>
+
+    <!-- Page type summary chips (text / image / mixed / empty counts) -->
+    <div id="summaryChips" class="summary-chips hidden"></div>
+
+    <!-- Download buttons (hidden until a file is ready) -->
+    <a id="downloadBtn" class="download-btn hidden" href="#" download>⬇ Download Full JSON</a>
+    <a id="downloadRecordsBtn" class="download-btn records-btn hidden" href="#" download>⬇ Download Clean Records JSON</a>
+
+    <!-- Per-page breakdown table -->
+    <div id="pageTableWrap" class="page-table-wrap hidden">
+      <h2>Per-page breakdown</h2>
+      <table id="pageTable" class="page-table">
+        <thead>
+          <tr>
+            <th>Page</th>
+            <th>Type</th>
+            <th>Has text</th>
+            <th>Has image</th>
+            <th>Images</th>
+            <th>Method used</th>
+            <th>Lines extracted</th>
+          </tr>
+        </thead>
+        <tbody id="pageTableBody"></tbody>
+      </table>
+    </div>
+
+    <!-- Preview of extracted data -->
+    <pre id="previewBox" class="preview hidden"></pre>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>

@@ -1,0 +1,36 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+venv/
+backend/venv/
+*.egg-info/
+
+# ---------------------------------------------------------------------------
+# Generated app data (uploaded PDFs and their JSON output)
+# These are created automatically every time someone uses the app -- they
+# don't belong in version control, and would bloat the repo over time.
+# ---------------------------------------------------------------------------
+uploads/*
+outputs/*
+!uploads/.gitkeep
+!outputs/.gitkeep
+
+# ---------------------------------------------------------------------------
+# Benchmark results (generated every time you run benchmark.py)
+# ---------------------------------------------------------------------------
+benchmark/results/*
+!benchmark/results/.gitkeep
+benchmark/sample_pdfs/*
+!benchmark/sample_pdfs/.gitkeep
+
+# ---------------------------------------------------------------------------
+# OS / editor noise
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/

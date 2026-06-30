@@ -1,0 +1,416 @@
+"""
+Benchmark script for the PDF-to-JSON service.
+
+Measures two things, as requested:
+
+  THROUGHPUT   -> how many PDFs / pages the service processes per minute.
+  EFFECTIVENESS -> how often it extracts something *correctly*.
+
+IMPORTANT ABOUT "EFFECTIVENESS" RIGHT NOW:
+  True accuracy requires a ground-truth answer key (a human has checked,
+  for a given PDF, exactly what the correct extracted data should be).
+  That doesn't exist yet for this project. So for now this script reports
+  PROXY health signals instead — things that are *correlated* with
+  extraction quality and catch real problems (crashes, silent failures,
+  OCR not running) without needing ground truth:
+
+    - success_rate            : % of PDFs that processed without error
+    - empty_extraction_rate   : % of (non-empty) PDFs where 0 rows came out
+                                 despite having pages — a strong signal
+                                 something went wrong
+    - ocr_unavailable_rate    : % of image-only pages that COULDN'T be
+                                 read because OCR wasn't installed/available
+    - table_detection_rate    : % of PDFs where Camelot found a real
+                                 structured table (vs falling back to
+                                 plain text lines)
+
+  Once you have a few PDFs with known-correct answers, drop them into
+  benchmark/ground_truth/ as <name>.expected.json (same shape as the
+  "records" field in the API output) and re-run with --ground-truth.
+  This script will then report TRUE accuracy (per-field and per-record
+  match rate) for those specific files, in addition to the proxy metrics
+  above for everything else.
+
+USAGE:
+  # Point at a running instance (local Docker, Railway, anywhere) and a
+  # folder of PDFs to throw at it:
+  python benchmark.py --url http://localhost:5000 --pdf-dir ./sample_pdfs
+
+  # With ground truth for a subset of files:
+  python benchmark.py --url http://localhost:5000 --pdf-dir ./sample_pdfs \\
+      --ground-truth ./ground_truth
+
+Results are printed to the console AND saved as a timestamped JSON file
+in benchmark/results/, so you can track whether throughput/effectiveness
+improves or regresses as you change the extraction code over time.
+"""
+
+import argparse
+import glob
+import json
+import os
+import time
+from datetime import datetime, timezone
+
+import requests
+
+
+def discover_pdfs(pdf_dir):
+    return sorted(glob.glob(os.path.join(pdf_dir, "*.pdf")))
+
+
+def load_ground_truth(ground_truth_dir, pdf_filename):
+    """
+    Looks for benchmark/ground_truth/<basename>.expected.json matching
+    the given PDF. Returns the parsed expected records list, or None if
+    no ground truth file exists for this PDF (which is the normal case
+    until ground truth is built up).
+    """
+    if not ground_truth_dir:
+        return None
+    base = os.path.splitext(os.path.basename(pdf_filename))[0]
+    expected_path = os.path.join(ground_truth_dir, f"{base}.expected.json")
+    if not os.path.exists(expected_path):
+        return None
+    with open(expected_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def compare_records(actual_records, expected_records):
+    """
+    Simple, transparent accuracy comparison: for each expected record,
+    look for an actual record that matches on every field. This is
+    intentionally strict (exact match) — loosen it later (e.g. fuzzy
+    string match, per-field scoring) once real ground truth reveals
+    what kind of near-misses actually show up in practice.
+
+    Returns (matched_count, total_expected, field_accuracy) where
+    field_accuracy is the fraction of individual fields, across all
+    expected records, that had a correct value in SOME actual record
+    at the same position (looser than full-record match, useful for
+    spotting "almost right" extractions).
+    """
+    matched = 0
+    field_hits = 0
+    field_total = 0
+
+    for i, expected in enumerate(expected_records):
+        actual = actual_records[i] if i < len(actual_records) else {}
+        if actual == expected:
+            matched += 1
+        for key, expected_val in expected.items():
+            field_total += 1
+            if str(actual.get(key, "")).strip() == str(expected_val).strip():
+                field_hits += 1
+
+    field_accuracy = round(field_hits / field_total, 4) if field_total else None
+    return matched, len(expected_records), field_accuracy
+
+
+def run_benchmark(base_url, pdf_dir, ground_truth_dir=None, timeout=300):
+    pdfs = discover_pdfs(pdf_dir)
+    if not pdfs:
+        print(f"No PDFs found in {pdf_dir}. Add some .pdf files there first.")
+        return None
+
+    print(f"Found {len(pdfs)} PDF(s) in {pdf_dir}. Benchmarking against {base_url} ...\n")
+
+    per_file_results = []
+    benchmark_started = time.monotonic()
+
+    for pdf_path in pdfs:
+        filename = os.path.basename(pdf_path)
+        print(f"  -> {filename} ...", end=" ", flush=True)
+
+        record = {
+            "file": filename,
+            "success": False,
+            "error": None,
+            "client_seconds": None,     # wall-clock time including network
+            "server_seconds": None,     # time the server itself reported
+            "page_count": None,
+            "row_count": None,
+            "record_count": None,
+            "page_type_counts": None,
+            "ocr_pages_total": 0,
+            "ocr_unavailable_pages": 0,
+            "table_found": False,
+            "ground_truth_checked": False,
+            "ground_truth_matched": None,
+            "ground_truth_total": None,
+            "ground_truth_field_accuracy": None,
+        }
+
+        client_start = time.monotonic()
+        try:
+            with open(pdf_path, "rb") as f:
+                response = requests.post(
+                    f"{base_url}/api/process",
+                    files={"file": (filename, f, "application/pdf")},
+                    timeout=timeout,
+                )
+            record["client_seconds"] = round(time.monotonic() - client_start, 3)
+
+            if response.status_code != 200:
+                record["error"] = f"HTTP {response.status_code}: {response.text[:300]}"
+                print(f"FAILED ({record['error']})")
+                per_file_results.append(record)
+                continue
+
+            result = response.json()
+            record["success"] = True
+            record["server_seconds"] = result.get("processing_seconds")
+            record["page_count"] = result.get("page_count")
+            record["row_count"] = result.get("row_count")
+            record["record_count"] = result.get("record_count")
+            record["page_type_counts"] = result.get("page_type_counts")
+
+            for page in result.get("pages", []):
+                if page.get("type") == "image":
+                    if page.get("ocr_used"):
+                        record["ocr_pages_total"] += 1
+                    elif page.get("extraction_method") == "ocr_unavailable":
+                        record["ocr_unavailable_pages"] += 1
+
+            record["table_found"] = bool(result.get("record_count"))
+
+            expected = load_ground_truth(ground_truth_dir, filename)
+            if expected is not None:
+                record["ground_truth_checked"] = True
+                matched, total, field_acc = compare_records(result.get("records", []), expected)
+                record["ground_truth_matched"] = matched
+                record["ground_truth_total"] = total
+                record["ground_truth_field_accuracy"] = field_acc
+
+            print(f"OK ({record['server_seconds']}s server, {record['page_count']} page(s))")
+
+        except requests.exceptions.RequestException as e:
+            record["client_seconds"] = round(time.monotonic() - client_start, 3)
+            record["error"] = str(e)
+            print(f"FAILED ({e})")
+
+        per_file_results.append(record)
+
+    benchmark_elapsed = round(time.monotonic() - benchmark_started, 3)
+
+    # --- Aggregate throughput ---
+    successful = [r for r in per_file_results if r["success"]]
+    total_pages = sum(r["page_count"] or 0 for r in successful)
+    total_server_seconds = sum(r["server_seconds"] or 0 for r in successful)
+
+    throughput = {
+        "total_pdfs": len(per_file_results),
+        "successful_pdfs": len(successful),
+        "wall_clock_seconds": benchmark_elapsed,
+        "pdfs_per_minute_wall_clock": round(len(successful) / benchmark_elapsed * 60, 2) if benchmark_elapsed > 0 else None,
+        "total_pages_processed": total_pages,
+        "total_server_processing_seconds": round(total_server_seconds, 3),
+        "pages_per_minute_server_time": round(total_pages / total_server_seconds * 60, 2) if total_server_seconds > 0 else None,
+        "avg_seconds_per_pdf_server_time": round(total_server_seconds / len(successful), 3) if successful else None,
+    }
+
+    # --- Aggregate effectiveness (proxy metrics) ---
+    total = len(per_file_results)
+    empty_extractions = [
+        r for r in successful
+        if (r["page_count"] or 0) > 0 and (r["row_count"] or 0) == 0
+    ]
+    total_ocr_attempts = sum(r["ocr_pages_total"] + r["ocr_unavailable_pages"] for r in successful)
+    total_ocr_unavailable = sum(r["ocr_unavailable_pages"] for r in successful)
+    pdfs_with_table = [r for r in successful if r["table_found"]]
+
+    gt_checked = [r for r in successful if r["ground_truth_checked"]]
+    gt_field_accuracies = [r["ground_truth_field_accuracy"] for r in gt_checked if r["ground_truth_field_accuracy"] is not None]
+
+    effectiveness = {
+        "success_rate": round(len(successful) / total, 4) if total else None,
+        "empty_extraction_rate": round(len(empty_extractions) / len(successful), 4) if successful else None,
+        "empty_extraction_files": [r["file"] for r in empty_extractions],
+        "ocr_unavailable_rate": round(total_ocr_unavailable / total_ocr_attempts, 4) if total_ocr_attempts else None,
+        "table_detection_rate": round(len(pdfs_with_table) / len(successful), 4) if successful else None,
+        "ground_truth": {
+            "files_checked": len(gt_checked),
+            "note": "Empty until ground-truth files exist in --ground-truth dir." if not gt_checked else None,
+            "avg_field_accuracy": round(sum(gt_field_accuracies) / len(gt_field_accuracies), 4) if gt_field_accuracies else None,
+            "per_file": [
+                {
+                    "file": r["file"],
+                    "records_matched": r["ground_truth_matched"],
+                    "records_expected": r["ground_truth_total"],
+                    "field_accuracy": r["ground_truth_field_accuracy"],
+                }
+                for r in gt_checked
+            ],
+        },
+    }
+
+    summary = {
+        "run_at": datetime.now(timezone.utc).isoformat(),
+        "base_url": base_url,
+        "pdf_dir": pdf_dir,
+        "throughput": throughput,
+        "effectiveness": effectiveness,
+        "per_file_results": per_file_results,
+    }
+
+    return summary
+
+
+def print_summary(summary):
+    print("\n" + "=" * 60)
+    print("THROUGHPUT")
+    print("=" * 60)
+    for k, v in summary["throughput"].items():
+        print(f"  {k}: {v}")
+
+    print("\n" + "=" * 60)
+    print("EFFECTIVENESS (proxy metrics — no ground truth yet unless noted)")
+    print("=" * 60)
+    eff = summary["effectiveness"]
+    print(f"  success_rate: {eff['success_rate']}")
+    print(f"  empty_extraction_rate: {eff['empty_extraction_rate']}")
+    if eff["empty_extraction_files"]:
+        print(f"    -> files with 0 rows extracted despite having pages: {eff['empty_extraction_files']}")
+    print(f"  ocr_unavailable_rate: {eff['ocr_unavailable_rate']}")
+    print(f"  table_detection_rate: {eff['table_detection_rate']}")
+
+    gt = eff["ground_truth"]
+    if gt["files_checked"]:
+        print(f"\n  Ground truth checked: {gt['files_checked']} file(s)")
+        print(f"  Average field accuracy: {gt['avg_field_accuracy']}")
+        for item in gt["per_file"]:
+            print(f"    - {item['file']}: {item['records_matched']}/{item['records_expected']} records matched exactly, "
+                  f"{item['field_accuracy']} field accuracy")
+    else:
+        print(f"\n  Ground truth: {gt['note']}")
+    print()
+
+
+def write_throughput_report(summary, results_dir, timestamp):
+    """
+    Writes a plain, standalone throughput report — no JSON, no effectiveness
+    numbers mixed in. Just the speed/capacity numbers, in a format you can
+    open and read directly.
+    """
+    t = summary["throughput"]
+    lines = []
+    lines.append("THROUGHPUT REPORT")
+    lines.append("=" * 50)
+    lines.append(f"Run date:        {summary['run_at']}")
+    lines.append(f"Service URL:     {summary['base_url']}")
+    lines.append(f"PDF folder:      {summary['pdf_dir']}")
+    lines.append("")
+    lines.append(f"PDFs tested:               {t['total_pdfs']}")
+    lines.append(f"PDFs processed OK:         {t['successful_pdfs']}")
+    lines.append(f"Total pages processed:     {t['total_pages_processed']}")
+    lines.append("")
+    lines.append(f"PDFs per minute:           {t['pdfs_per_minute_wall_clock']}")
+    lines.append(f"Pages per minute:          {t['pages_per_minute_server_time']}")
+    lines.append(f"Average time per PDF:      {t['avg_seconds_per_pdf_server_time']} seconds")
+    lines.append(f"Total wall-clock time:     {t['wall_clock_seconds']} seconds")
+    lines.append("")
+    lines.append("Per-file timing:")
+    lines.append("-" * 50)
+    for r in summary["per_file_results"]:
+        if r["success"]:
+            lines.append(f"  {r['file']}: {r['server_seconds']}s, {r['page_count']} page(s)")
+        else:
+            lines.append(f"  {r['file']}: FAILED ({r['error']})")
+
+    report_text = "\n".join(lines) + "\n"
+    out_path = os.path.join(results_dir, f"throughput_report_{timestamp}.txt")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(report_text)
+    return out_path, report_text
+
+
+def write_effectiveness_report(summary, results_dir, timestamp):
+    """
+    Writes a plain, standalone effectiveness report — separate from
+    throughput. Makes clear which numbers are TRUE accuracy (ground
+    truth) vs PROXY signals (no ground truth yet), so the two are never
+    confused with each other.
+    """
+    e = summary["effectiveness"]
+    gt = e["ground_truth"]
+    lines = []
+    lines.append("EFFECTIVENESS REPORT")
+    lines.append("=" * 50)
+    lines.append(f"Run date:        {summary['run_at']}")
+    lines.append(f"Service URL:     {summary['base_url']}")
+    lines.append(f"PDF folder:      {summary['pdf_dir']}")
+    lines.append("")
+
+    if gt["files_checked"]:
+        lines.append(f"TRUE ACCURACY (ground truth checked for {gt['files_checked']} file(s))")
+        lines.append("-" * 50)
+        lines.append(f"Average field accuracy:   {gt['avg_field_accuracy']}")
+        for item in gt["per_file"]:
+            lines.append(f"  {item['file']}: {item['records_matched']}/{item['records_expected']} "
+                          f"records exact match, {item['field_accuracy']} field accuracy")
+        lines.append("")
+
+    lines.append("PROXY SIGNALS (no ground truth yet for the rest — these are health")
+    lines.append("checks, not proof the extracted data is correct)")
+    lines.append("-" * 50)
+    lines.append(f"Success rate:              {e['success_rate']}   (processed without crashing)")
+    lines.append(f"Empty-extraction rate:     {e['empty_extraction_rate']}   (0 rows out despite having pages)")
+    lines.append(f"OCR-unavailable rate:      {e['ocr_unavailable_rate']}   (scanned pages OCR couldn't read)")
+    lines.append(f"Table-detection rate:      {e['table_detection_rate']}   (found a real table vs plain text)")
+    if e["empty_extraction_files"]:
+        lines.append("")
+        lines.append(f"Files with 0 rows extracted (worth checking manually):")
+        for f in e["empty_extraction_files"]:
+            lines.append(f"  - {f}")
+
+    if not gt["files_checked"]:
+        lines.append("")
+        lines.append("NOTE: No ground truth files found yet, so this report cannot tell you")
+        lines.append("whether the extracted DATA is actually correct -- only whether the")
+        lines.append("process ran cleanly. See benchmark/README.md for how to add ground")
+        lines.append("truth and get a real accuracy number.")
+
+    report_text = "\n".join(lines) + "\n"
+    out_path = os.path.join(results_dir, f"effectiveness_report_{timestamp}.txt")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(report_text)
+    return out_path, report_text
+
+
+def save_results(summary, results_dir):
+    os.makedirs(results_dir, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+    throughput_path, throughput_text = write_throughput_report(summary, results_dir, timestamp)
+    effectiveness_path, effectiveness_text = write_effectiveness_report(summary, results_dir, timestamp)
+
+    # Raw JSON is still saved too -- useful if you ever want to script
+    # against the numbers (e.g. compare runs automatically) -- but it's
+    # no longer the primary thing printed/handed back to you.
+    json_path = os.path.join(results_dir, f"benchmark_{timestamp}.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    print(f"\nThroughput report saved to:    {throughput_path}")
+    print(f"Effectiveness report saved to: {effectiveness_path}")
+    print(f"(Raw JSON also saved to:        {json_path})")
+
+    return throughput_path, effectiveness_path, json_path
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Benchmark the PDF-to-JSON service's throughput and effectiveness.")
+    parser.add_argument("--url", default="http://localhost:5000", help="Base URL of the running service.")
+    parser.add_argument("--pdf-dir", default=os.path.join(os.path.dirname(__file__), "sample_pdfs"),
+                         help="Folder of PDFs to benchmark against.")
+    parser.add_argument("--ground-truth", default=None,
+                         help="Folder of <name>.expected.json ground-truth files (optional).")
+    parser.add_argument("--timeout", type=int, default=300, help="Per-request timeout in seconds.")
+    parser.add_argument("--results-dir", default=os.path.join(os.path.dirname(__file__), "results"),
+                         help="Where to save the report files.")
+    args = parser.parse_args()
+
+    summary = run_benchmark(args.url, args.pdf_dir, args.ground_truth, args.timeout)
+    if summary:
+        print_summary(summary)
+        save_results(summary, args.results_dir)

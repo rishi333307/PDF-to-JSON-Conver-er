@@ -1,0 +1,13 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+venv
+backend/venv
+uploads/*
+outputs/*
+!uploads/.gitkeep
+!outputs/.gitkeep
+*.log
+.DS_Store
+benchmark/results
